@@ -8,30 +8,29 @@ AI-powered study assistant using **Gemini API**, **RAG pipeline**, **MongoDB**, 
 
 ```
 studymind/
-├── backend/                  # Node.js / Express API
-│   ├── config/
-│   │   ├── db.js             # MongoDB connection
-│   │   └── firebase.js       # Firebase Admin SDK
-│   ├── middleware/
-│   │   └── auth.js           # Firebase JWT verification
-│   ├── models/
-│   │   ├── User.js
-│   │   ├── Note.js           # Chunked documents
-│   │   ├── Session.js        # Chat history
-│   │   └── Flashcard.js
-│   ├── routes/
-│   │   ├── auth.js           # POST /api/auth/sync
-│   │   ├── notes.js          # Upload / index notes
-│   │   ├── generate.js       # Summary / concepts / flashcards / MCQ
-│   │   └── chat.js           # RAG chat with session memory
-│   ├── utils/
-│   │   ├── chunker.js        # Text chunking + RAG retrieval
-│   │   └── gemini.js         # Gemini API wrapper (text, stream, JSON)
-│   ├── server.js
-│   ├── .env.example
-│   └── package.json
+├── config/                   # MongoDB & Firebase configuration
+│   ├── db.js                 # MongoDB connection
+│   └── firebase.js           # Firebase Admin SDK
+├── middleware/
+│   └── auth.js               # Firebase JWT verification
+├── models/
+│   ├── User.js
+│   ├── Note.js               # Chunked documents
+│   ├── Session.js            # Chat history
+│   └── Flashcard.js
+├── routes/
+│   ├── auth.js               # POST /api/auth/sync
+│   ├── notes.js              # Upload / index notes
+│   ├── generate.js           # Summary / concepts / flashcards / MCQ
+│   └── chat.js               # RAG chat with session memory
+├── utils/
+│   ├── chunker.js            # Text chunking + RAG retrieval
+│   └── gemini.js             # Gemini API wrapper (text, stream, JSON)
+├── server.js                 # Backend server entry point
+├── .env.example
+├── package.json
 │
-└── frontend/                 # React.js
+└── frontend/                 # React.js frontend
     ├── public/index.html
     ├── src/
     │   ├── firebase.js       # Firebase client init
