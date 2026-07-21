@@ -1,4 +1,4 @@
-# 📚 StudyMind AI — Full Stack
+# 📚 StudyMind AI 
 
 AI-powered study assistant using **Gemini API**, **RAG pipeline**, **MongoDB**, **Firebase Auth**, **React.js**, and **Node.js/Express**.
 
