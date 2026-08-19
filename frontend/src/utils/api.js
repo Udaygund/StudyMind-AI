@@ -29,7 +29,7 @@ export const generateMCQ = (noteId, count = 5) =>
 export const toggleFlashcardLearned = (noteId, cardIndex, learned) =>
   client.patch(`/generate/flashcards/${noteId}/learned`, { cardIndex, learned });
 
-export const streamSSE = async (path, body, onChunk, onDone, onError) => {
+export const streamSSE = async (path, body, onChunk, onDone, onError, signal) => {
   const user = auth.currentUser;
   if (!user) throw new Error('Not signed in');
   const token = await user.getIdToken();
@@ -41,6 +41,7 @@ export const streamSSE = async (path, body, onChunk, onDone, onError) => {
       Authorization:   `Bearer ${token}`,
     },
     body: JSON.stringify(body),
+    signal,
   });
 
   if (!res.ok) {
@@ -48,32 +49,41 @@ export const streamSSE = async (path, body, onChunk, onDone, onError) => {
     throw new Error(err.message || 'Request failed');
   }
 
+  if (!res.body) { onDone?.(); return; }
+
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let doneCalled = false;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
+  const callDone = () => { if (!doneCalled) { doneCalled = true; onDone?.(); } };
 
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue;
-      try {
-        const data = JSON.parse(line.slice(6));
-        if (data.error) onError?.(data.error);
-        else if (data.done) onDone?.();
-        else if (data.text) onChunk?.(data.text);
-      } catch {
-        /* skip malformed */
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const data = JSON.parse(line.slice(6));
+          if (data.error) onError?.(data.error);
+          else if (data.done) { callDone(); return; }
+          else if (data.text) onChunk?.(data.text);
+        } catch {
+          /* skip malformed */
+        }
       }
     }
+  } finally {
+    callDone();
   }
 };
 
-export const streamChatMessage = (sessionId, message, onChunk, onDone, onError) =>
-  streamSSE('/chat/message', { sessionId, message }, onChunk, onDone, onError);
+export const streamChatMessage = (sessionId, message, onChunk, onDone, onError, signal) =>
+  streamSSE('/chat/message', { sessionId, message }, onChunk, onDone, onError, signal);
 
 export default client;

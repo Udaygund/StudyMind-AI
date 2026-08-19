@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import toast from 'react-hot-toast';
 import { useAuth } from '../context/AuthContext';
+import { useTheme } from '../context/ThemeContext';
 import UploadZone from '../components/UploadZone';
 import Generator  from '../components/Generator';
 import ChatPanel  from '../components/ChatPanel';
@@ -8,10 +9,23 @@ import Flashcards from '../components/Flashcards';
 import MCQQuiz    from '../components/MCQQuiz';
 import { fetchNotes, deleteNote } from '../utils/api';
 
-const TABS = ['📄 Upload', '⚡ Generate', '💬 Chat', '🃏 Flashcards', '🧠 MCQ'];
+const TABS = ['Upload', 'Generate', 'Chat', 'Flashcards', 'Quiz'];
+
+const SunIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="12" cy="12" r="5" /><line x1="12" y1="1" x2="12" y2="3" /><line x1="12" y1="21" x2="12" y2="23" /><line x1="4.22" y1="4.22" x2="5.64" y2="5.64" /><line x1="18.36" y1="18.36" x2="19.78" y2="19.78" /><line x1="1" y1="12" x2="3" y2="12" /><line x1="21" y1="12" x2="23" y2="12" /><line x1="4.22" y1="19.78" x2="5.64" y2="18.36" /><line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
+  </svg>
+);
+
+const MoonIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+  </svg>
+);
 
 export default function Dashboard() {
   const { user, logout }       = useAuth();
+  const { theme, toggle }      = useTheme();
   const [tab,        setTab]   = useState(0);
   const [notes,      setNotes] = useState([]);
   const [activeNote, setActive]= useState(null);
@@ -21,16 +35,24 @@ export default function Dashboard() {
 
   useEffect(() => {
     fetchNotes()
-      .then(({ data }) => { setNotes(data.notes); if (data.notes[0]) setActive(data.notes[0]); })
-      .catch(() => {});
+      .then(({ data }) => {
+        const list = data.notes || [];
+        setNotes(list);
+        if (list[0]) setActive(list[0]);
+      })
+      .catch((err) => { console.error('Failed to fetch notes:', err); });
   }, []);
 
   const onNoteCreated = (note) => {
     setNotes(prev => [note, ...prev]);
     setActive(note);
     setTab(1);
-    toast.success('Note ready — now generate!');
+    toast.success('Note indexed');
   };
+
+  useEffect(() => {
+    setFCs([]); setFCNid(null); setMCQ([]);
+  }, [activeNote?._id]);
 
   const onDelete = async (id) => {
     try {
@@ -38,8 +60,8 @@ export default function Dashboard() {
       const next = notes.filter(n => n._id !== id);
       setNotes(next);
       if (activeNote?._id === id) setActive(next[0] || null);
-      toast.success('Note deleted');
-    } catch { toast.error('Delete failed'); }
+      toast.success('Deleted');
+    } catch (err) { console.error('Delete failed:', err); toast.error('Delete failed'); }
   };
 
   const onFlashcards = (cards, noteId) => {
@@ -54,14 +76,19 @@ export default function Dashboard() {
     <div style={s.page}>
       <header style={s.header}>
         <div style={s.logo}>
-          <div style={s.logoIcon}>📚</div>
-          <div>
-            <div style={s.logoText}>StudyMind AI</div>
-            <div style={s.logoSub}>RAG-powered · Gemini · MongoDB</div>
-          </div>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--text-2)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20" />
+          </svg>
+          <span style={s.logoText}>StudyMind</span>
         </div>
         <div style={s.headerRight}>
-          <div style={s.avatar}>{user?.displayName?.[0] || user?.email?.[0] || '?'}</div>
+          <button
+            style={s.themeBtn}
+            onClick={toggle}
+            aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+          >
+            {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
+          </button>
           <span style={s.userName}>{user?.displayName || user?.email}</span>
           <button style={s.logoutBtn} onClick={logout}>Sign out</button>
         </div>
@@ -69,27 +96,44 @@ export default function Dashboard() {
 
       <div style={s.layout}>
         <aside style={s.sidebar}>
-          <div style={s.sideLabel}>Your Notes</div>
-          {notes.length === 0 && (
-            <div style={s.noNotes}>No notes yet — upload one</div>
-          )}
-          {notes.map(n => (
-            <div
-              key={n._id}
-              style={{ ...s.noteItem, ...(activeNote?._id === n._id ? s.noteActive : {}) }}
-              onClick={() => { setActive(n); setTab(1); }}
-            >
-              <div style={s.noteItemTitle}>{n.title}</div>
-              <div style={s.noteItemMeta}>{n.chunks} chunks · {n.source}</div>
-              <button style={s.deleteBtn} onClick={e => { e.stopPropagation(); onDelete(n._id); }}>✕</button>
-            </div>
-          ))}
+          <div style={s.sideHeader}>
+            <span style={s.sideLabel}>Notes</span>
+            <span style={s.noteCount}>{notes.length}</span>
+          </div>
+          <div style={s.noteList}>
+            {notes.length === 0 && (
+              <div style={s.noNotes}>No notes yet</div>
+            )}
+            {notes.map(n => (
+              <div
+                key={n._id}
+                style={{ ...s.noteItem, ...(activeNote?._id === n._id ? s.noteActive : {}) }}
+                onClick={() => { setActive(n); setTab(1); }}
+              >
+                <div style={s.noteItemTitle}>{n.title}</div>
+                <div style={s.noteItemMeta}>{n.chunks} chunks</div>
+                <button
+                  style={s.deleteBtn}
+                  onClick={e => { e.stopPropagation(); onDelete(n._id); }}
+                  aria-label="Delete note"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+                  </svg>
+                </button>
+              </div>
+            ))}
+          </div>
         </aside>
 
         <main style={s.main}>
           <div style={s.tabs}>
             {TABS.map((t, i) => (
-              <button key={i} style={{ ...s.tab, ...(tab === i ? s.tabActive : {}) }} onClick={() => setTab(i)}>
+              <button
+                key={t}
+                style={{ ...s.tab, ...(tab === i ? s.tabActive : {}) }}
+                onClick={() => setTab(i)}
+              >
                 {t}
               </button>
             ))}
@@ -121,28 +165,176 @@ export default function Dashboard() {
 }
 
 const s = {
-  page:          { minHeight: '100vh', background: '#0a0a0f', fontFamily: "'Syne', sans-serif", color: '#f0effe' },
-  header:        { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 28px', borderBottom: '1px solid #2a2845', background: '#0a0a0f', position: 'sticky', top: 0, zIndex: 100 },
-  logo:          { display: 'flex', alignItems: 'center', gap: 12 },
-  logoIcon:      { width: 36, height: 36, background: 'linear-gradient(135deg,#7c6dfa,#fa6d8f)', borderRadius: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18 },
-  logoText:      { fontSize: 17, fontWeight: 800, letterSpacing: '-.02em' },
-  logoSub:       { fontSize: 10, color: '#5a5680', fontFamily: "'DM Mono', monospace", letterSpacing: '.06em' },
-  headerRight:   { display: 'flex', alignItems: 'center', gap: 10 },
-  avatar:        { width: 30, height: 30, borderRadius: '50%', background: '#7c6dfa', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, fontWeight: 700 },
-  userName:      { fontSize: 13, color: '#9893c8', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-  logoutBtn:     { padding: '6px 14px', background: 'transparent', border: '1px solid #2a2845', borderRadius: 8, color: '#5a5680', fontSize: 12, cursor: 'pointer', fontFamily: "'Syne', sans-serif" },
-  layout:        { display: 'flex', maxWidth: 1200, margin: '0 auto', padding: '24px 20px', gap: 24 },
-  sidebar:       { width: 220, flexShrink: 0 },
-  sideLabel:     { fontSize: 10, fontWeight: 700, letterSpacing: '.12em', color: '#5a5680', textTransform: 'uppercase', fontFamily: "'DM Mono', monospace", marginBottom: 10 },
-  noNotes:       { fontSize: 12, color: '#5a5680', fontFamily: "'DM Mono', monospace", padding: '12px 0' },
-  noteItem:      { padding: '10px 12px', borderRadius: 10, border: '1px solid transparent', cursor: 'pointer', marginBottom: 4, position: 'relative', transition: 'all .15s' },
-  noteActive:    { background: '#12121a', borderColor: '#2a2845' },
-  noteItemTitle: { fontSize: 13, fontWeight: 600, color: '#f0effe', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', paddingRight: 20 },
-  noteItemMeta:  { fontSize: 11, color: '#5a5680', fontFamily: "'DM Mono', monospace", marginTop: 3 },
-  deleteBtn:     { position: 'absolute', top: 10, right: 8, background: 'transparent', border: 'none', color: '#5a5680', cursor: 'pointer', fontSize: 12, padding: '0 4px' },
-  main:          { flex: 1, minWidth: 0 },
-  tabs:          { display: 'flex', gap: 4, background: '#12121a', border: '1px solid #2a2845', borderRadius: 12, padding: 4, marginBottom: 24 },
-  tab:           { flex: 1, padding: '9px 6px', textAlign: 'center', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer', transition: 'all .15s', color: '#5a5680', border: 'none', background: 'transparent', letterSpacing: '.01em' },
-  tabActive:     { background: '#1a1a26', color: '#f0effe', boxShadow: '0 0 0 1px #2a2845' },
-  content:       { background: '#0d0d15', border: '1px solid #2a2845', borderRadius: 14, padding: 24, minHeight: 400 },
+  page: {
+    minHeight: '100vh',
+    background: 'var(--bg-0)',
+    color: 'var(--text-0)',
+  },
+  header: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '0 24px',
+    height: 48,
+    borderBottom: '1px solid var(--border-subtle)',
+    position: 'sticky',
+    top: 0,
+    zIndex: 100,
+    background: 'var(--header-bg)',
+    backdropFilter: 'blur(12px)',
+  },
+  logo: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+  },
+  logoText: {
+    fontSize: 14,
+    fontWeight: 600,
+    color: 'var(--text-0)',
+    letterSpacing: '-0.01em',
+  },
+  headerRight: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+  },
+  themeBtn: {
+    width: 30,
+    height: 30,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 'var(--radius)',
+    color: 'var(--text-2)',
+    border: '1px solid var(--border-subtle)',
+    background: 'transparent',
+    transition: 'color 0.15s, border-color 0.15s',
+  },
+  userName: {
+    fontSize: 13,
+    color: 'var(--text-2)',
+    maxWidth: 160,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+  },
+  logoutBtn: {
+    padding: '5px 12px',
+    background: 'transparent',
+    border: '1px solid var(--border)',
+    borderRadius: 'var(--radius)',
+    color: 'var(--text-2)',
+    fontSize: 12,
+    fontWeight: 500,
+    transition: 'border-color 0.15s, color 0.15s',
+  },
+  layout: {
+    display: 'flex',
+    maxWidth: 1120,
+    margin: '0 auto',
+    padding: '20px 24px',
+    gap: 32,
+    minHeight: 'calc(100vh - 48px)',
+  },
+  sidebar: {
+    width: 200,
+    flexShrink: 0,
+  },
+  sideHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+    padding: '0 4px',
+  },
+  sideLabel: {
+    fontSize: 11,
+    fontWeight: 500,
+    color: 'var(--text-2)',
+    textTransform: 'uppercase',
+    letterSpacing: '0.06em',
+  },
+  noteCount: {
+    fontSize: 11,
+    color: 'var(--text-2)',
+    background: 'var(--bg-3)',
+    padding: '1px 6px',
+    borderRadius: 4,
+  },
+  noteList: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 2,
+  },
+  noNotes: {
+    fontSize: 13,
+    color: 'var(--text-2)',
+    padding: '16px 4px',
+  },
+  noteItem: {
+    padding: '8px 10px',
+    borderRadius: 'var(--radius)',
+    cursor: 'pointer',
+    position: 'relative',
+    transition: 'background 0.12s',
+  },
+  noteActive: {
+    background: 'var(--bg-2)',
+  },
+  noteItemTitle: {
+    fontSize: 13,
+    fontWeight: 500,
+    color: 'var(--text-0)',
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    paddingRight: 24,
+  },
+  noteItemMeta: {
+    fontSize: 11,
+    color: 'var(--text-2)',
+    marginTop: 2,
+  },
+  deleteBtn: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    background: 'transparent',
+    border: 'none',
+    color: 'var(--text-2)',
+    padding: 4,
+    borderRadius: 4,
+    opacity: 0,
+    transition: 'opacity 0.12s, color 0.12s',
+    display: 'flex',
+    alignItems: 'center',
+  },
+  main: {
+    flex: 1,
+    minWidth: 0,
+  },
+  tabs: {
+    display: 'flex',
+    gap: 2,
+    borderBottom: '1px solid var(--border-subtle)',
+    marginBottom: 24,
+  },
+  tab: {
+    padding: '8px 14px',
+    borderRadius: 'var(--radius) var(--radius) 0 0',
+    fontSize: 13,
+    fontWeight: 500,
+    color: 'var(--text-2)',
+    background: 'transparent',
+    transition: 'color 0.12s, background 0.12s',
+    position: 'relative',
+  },
+  tabActive: {
+    color: 'var(--text-0)',
+    background: 'var(--bg-2)',
+  },
+  content: {
+    minHeight: 400,
+  },
 };

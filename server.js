@@ -74,7 +74,7 @@ app.use((err, req, res, next) => {
   });
 });
 
-// ── Start server ─────────────────────────────────────
+// ── Start server
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`🚀 StudyMind backend running on port ${PORT} [${process.env.NODE_ENV}]`);

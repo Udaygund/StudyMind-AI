@@ -4,7 +4,7 @@ const getModel = () => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not configured');
   const genAI = new GoogleGenerativeAI(apiKey);
-  return genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-1.5-flash' });
+  return genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-3.7-flash' });
 };
 
 const generateTextStream = async (prompt, onChunk) => {

@@ -7,17 +7,26 @@ export default function MCQQuiz({ questions }) {
   const [done, setDone] = useState(false);
 
   if (!questions?.length) {
-    return <p style={s.muted}>Generate an MCQ quiz from the Generate tab.</p>;
+    return <p style={s.muted}>Generate a quiz from the Generate tab.</p>;
   }
 
   if (done) {
+    const pct = Math.round((score / questions.length) * 100);
     return (
-      <div style={s.center}>
-        <h2 style={s.title}>Quiz complete</h2>
-        <p style={s.score}>{score} / {questions.length} correct</p>
-        <button style={s.btn} onClick={() => { setIndex(0); setSelected(null); setScore(0); setDone(false); }}>
-          Retry
-        </button>
+      <div style={s.resultWrap}>
+        <div style={s.resultCard}>
+          <div style={s.resultScore}>{score}/{questions.length}</div>
+          <div style={s.resultPct}>{pct}%</div>
+          <div style={s.resultLabel}>
+            {pct >= 80 ? 'Well done' : pct >= 50 ? 'Not bad' : 'Keep practicing'}
+          </div>
+          <button
+            style={s.btn}
+            onClick={() => { setIndex(0); setSelected(null); setScore(0); setDone(false); }}
+          >
+            Try again
+          </button>
+        </div>
       </div>
     );
   }
@@ -35,29 +44,47 @@ export default function MCQQuiz({ questions }) {
     else { setIndex(index + 1); setSelected(null); }
   };
 
+  const letters = ['A', 'B', 'C', 'D'];
+
   return (
     <div>
-      <div style={s.counter}>Question {index + 1} of {questions.length}</div>
+      <div style={s.progress}>
+        <span style={s.progressText}>{index + 1} / {questions.length}</span>
+        <div style={s.progressBar}>
+          <div style={{ ...s.progressFill, width: `${((index + 1) / questions.length) * 100}%` }} />
+        </div>
+      </div>
+
       <h3 style={s.question}>{q.question}</h3>
+
       <div style={s.options}>
         {q.options.map((opt, i) => {
-          let style = s.option;
+          let style = { ...s.option };
           if (selected !== null) {
-            if (i === q.correct) style = { ...style, ...s.correct };
-            else if (i === selected) style = { ...style, ...s.wrong };
+            if (i === q.correct) {
+              style.borderColor = 'var(--green)';
+              style.background = 'var(--green-muted)';
+              style.color = 'var(--green)';
+            } else if (i === selected) {
+              style.borderColor = 'var(--red)';
+              style.background = 'var(--red-muted)';
+              style.color = 'var(--red)';
+            }
           }
           return (
             <button key={i} style={style} onClick={() => pick(i)} disabled={selected !== null}>
-              {opt}
+              <span style={s.optionLetter}>{letters[i]}</span>
+              <span>{opt}</span>
             </button>
           );
         })}
       </div>
+
       {selected !== null && (
         <div style={s.explain}>
-          <p>{q.explanation}</p>
+          <div style={s.explainText}>{q.explanation}</div>
           <button style={s.btn} onClick={next}>
-            {index + 1 >= questions.length ? 'Finish' : 'Next'}
+            {index + 1 >= questions.length ? 'Finish' : 'Next question'}
           </button>
         </div>
       )}
@@ -66,16 +93,119 @@ export default function MCQQuiz({ questions }) {
 }
 
 const s = {
-  muted:    { color: '#5a5680', fontFamily: "'DM Mono', monospace" },
-  center:   { textAlign: 'center' },
-  title:    { color: '#f0effe' },
-  score:    { fontSize: 24, color: '#6dfabd', fontFamily: "'DM Mono', monospace" },
-  counter:  { fontSize: 11, color: '#5a5680', fontFamily: "'DM Mono', monospace", marginBottom: 12 },
-  question: { fontSize: 18, color: '#f0effe', marginBottom: 20, lineHeight: 1.4 },
-  options:  { display: 'flex', flexDirection: 'column', gap: 8 },
-  option:   { padding: '14px 16px', background: '#12121a', border: '1px solid #2a2845', borderRadius: 10, color: '#f0effe', textAlign: 'left', cursor: 'pointer', fontFamily: "'Syne', sans-serif", fontSize: 14 },
-  correct:  { borderColor: '#6dfabd', background: 'rgba(109,250,189,.08)' },
-  wrong:    { borderColor: '#fa6d8f', background: 'rgba(250,109,143,.08)' },
-  explain:  { marginTop: 20, color: '#9893c8', fontSize: 14 },
-  btn:      { marginTop: 12, padding: '10px 20px', background: '#7c6dfa', border: 'none', borderRadius: 8, color: '#fff', fontWeight: 700, cursor: 'pointer' },
+  muted: {
+    color: 'var(--text-2)',
+    fontSize: 13,
+  },
+  progress: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 20,
+  },
+  progressText: {
+    fontSize: 12,
+    color: 'var(--text-2)',
+    fontVariantNumeric: 'tabular-nums',
+  },
+  progressBar: {
+    flex: 1,
+    height: 3,
+    background: 'var(--bg-3)',
+    borderRadius: 2,
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    background: 'var(--text-2)',
+    borderRadius: 2,
+    transition: 'width 0.2s ease',
+  },
+  question: {
+    fontSize: 16,
+    fontWeight: 500,
+    color: 'var(--text-0)',
+    marginBottom: 20,
+    lineHeight: 1.5,
+  },
+  options: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 6,
+  },
+  option: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+    padding: '12px 14px',
+    background: 'var(--bg-2)',
+    border: '1px solid var(--border)',
+    borderRadius: 'var(--radius)',
+    color: 'var(--text-1)',
+    textAlign: 'left',
+    fontSize: 13,
+    transition: 'border-color 0.15s, background 0.15s, color 0.15s',
+  },
+  optionLetter: {
+    width: 22,
+    height: 22,
+    borderRadius: 5,
+    background: 'var(--bg-3)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: 11,
+    fontWeight: 600,
+    color: 'var(--text-2)',
+    flexShrink: 0,
+  },
+  explain: {
+    marginTop: 20,
+    padding: 14,
+    background: 'var(--bg-2)',
+    borderRadius: 'var(--radius)',
+    border: '1px solid var(--border-subtle)',
+  },
+  explainText: {
+    color: 'var(--text-1)',
+    fontSize: 13,
+    lineHeight: 1.6,
+    marginBottom: 14,
+  },
+  btn: {
+    padding: '8px 16px',
+    background: 'var(--text-0)',
+    color: 'var(--bg-0)',
+    borderRadius: 'var(--radius)',
+    fontWeight: 500,
+    fontSize: 13,
+    transition: 'opacity 0.15s',
+  },
+  resultWrap: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 300,
+  },
+  resultCard: {
+    textAlign: 'center',
+  },
+  resultScore: {
+    fontSize: 48,
+    fontWeight: 600,
+    color: 'var(--text-0)',
+    fontVariantNumeric: 'tabular-nums',
+    lineHeight: 1,
+    marginBottom: 4,
+  },
+  resultPct: {
+    fontSize: 14,
+    color: 'var(--text-2)',
+    marginBottom: 4,
+  },
+  resultLabel: {
+    fontSize: 13,
+    color: 'var(--text-2)',
+    marginBottom: 24,
+  },
 };

@@ -15,8 +15,8 @@ export const AuthProvider = ({ children }) => {
       if (firebaseUser) {
         try {
           await syncUser();
-        } catch {
-          /* backend sync optional until configured */
+        } catch (err) {
+          console.warn('Backend sync failed:', err);
         }
       }
       setLoading(false);
