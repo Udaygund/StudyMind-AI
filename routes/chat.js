@@ -1,19 +1,29 @@
 const express  = require('express');
-const router   = express.Router();
+const mongoose = require('mongoose');
 const { v4: uuidv4 } = require('uuid');
 const { protect }    = require('../middleware/auth');
 const Note    = require('../models/Note');
 const Session = require('../models/Session');
 const { retrieveRelevantChunks } = require('../utils/chunker');
-const { generateTextStream }     = require('../utils/gemini');
+const { generateTextStream, generateJSONArray } = require('../utils/llm');
+const { openSSE, sendSSE, endSSE, failSSE } = require('../utils/sse');
+const { HttpError, assertObjectId } = require('../utils/validate');
+const { recordActivity } = require('../utils/activity');
 
-router.post('/session', protect, async (req, res) => {
+const router = express.Router();
+const MAX_MESSAGE_LEN = 4000;
+
+const SYSTEM_PROMPT = `You are StudyMind, a friendly and precise study tutor.
+Answer the student's question using ONLY the provided notes. If the notes don't cover it, say so clearly
+and suggest what to look up. Be concise and educational. Use Markdown (bold key terms, bullet lists,
+short code blocks when relevant).`;
+
+router.post('/session', protect, async (req, res, next) => {
   try {
     const { noteId } = req.body;
-    if (!noteId) return res.status(400).json({ message: 'noteId required' });
-
-    const note = await Note.findOne({ _id: noteId, userId: req.user.uid });
-    if (!note) return res.status(404).json({ message: 'Note not found' });
+    assertObjectId(noteId, 'noteId');
+    const note = await Note.findOne({ _id: noteId, userId: req.user.uid }).select('title');
+    if (!note) throw new HttpError(404, 'Note not found');
 
     const session = await Session.create({
       userId:    req.user.uid,
@@ -25,107 +35,116 @@ router.post('/session', protect, async (req, res) => {
     return res.status(201).json({
       sessionId: session.sessionId,
       _id:       session._id,
+      title:     session.title,
       noteTitle: note.title,
     });
   } catch (err) {
-    return res.status(500).json({ message: 'Failed to create session' });
+    next(err);
   }
 });
 
 router.post('/message', protect, async (req, res) => {
   try {
-    const { sessionId, message } = req.body;
-    if (!sessionId || !message?.trim()) {
-      return res.status(400).json({ message: 'sessionId and message required' });
-    }
+    const { sessionId } = req.body;
+    const message = String(req.body.message || '').trim().slice(0, MAX_MESSAGE_LEN);
+    if (!sessionId || !message) throw new HttpError(400, 'sessionId and message required');
 
     const session = await Session.findOne({ sessionId, userId: req.user.uid });
-    if (!session) return res.status(404).json({ message: 'Session not found' });
+    if (!session) throw new HttpError(404, 'Session not found');
 
-    const note = await Note.findById(session.noteId);
-    if (!note)  return res.status(404).json({ message: 'Associated note not found' });
+    const note = await Note.findOne({ _id: session.noteId, userId: req.user.uid });
+    if (!note) throw new HttpError(404, 'Associated note not found');
 
-    const context = retrieveRelevantChunks(note.chunks, message, 4);
+    // Include the previous question in the retrieval query so follow-ups
+    // like "explain that more" still find the right chunks.
+    const lastUser = [...session.messages].reverse().find(m => m.role === 'user');
+    const context  = retrieveRelevantChunks(note.chunks, `${message} ${lastUser?.content || ''}`, 5);
 
-    const recentMessages = session.messages.slice(-6);
-    const historyText = recentMessages
-      .map(m => `${m.role === 'user' ? 'Student' : 'Assistant'}: ${m.content}`)
-      .join('\n');
+    const history = session.messages.slice(-8).map(m => ({ role: m.role, content: m.content }));
+    const messages = [
+      { role: 'system', content: `${SYSTEM_PROMPT}\n\nNotes titled "${note.title}" (retrieved excerpts):\n${context}` },
+      ...history,
+      { role: 'user', content: message },
+    ];
 
-    const prompt = `You are a helpful study assistant. Answer the student's question based ONLY on the provided notes.
-If the answer is not in the notes, say so clearly and suggest what to look up.
-Be concise, accurate, and educational.
-
-Relevant Notes (retrieved via RAG):
-${context}
-
-${historyText ? `Previous conversation:\n${historyText}\n` : ''}
-Student: ${message}
-Assistant:`;
-
+    if (!session.messages.length) {
+      session.title = message.length > 60 ? `${message.slice(0, 57)}…` : message;
+    }
     session.messages.push({ role: 'user', content: message });
     await session.save();
 
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders();
-
-    let fullResponse = '';
-
-    await generateTextStream(prompt, (chunk) => {
-      fullResponse += chunk;
-      res.write(`data: ${JSON.stringify({ text: chunk })}\n\n`);
-    });
-
-    session.messages.push({ role: 'assistant', content: fullResponse });
-    await session.save();
-
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    res.end();
-  } catch (err) {
-    console.error('Chat error:', err);
-    if (!res.headersSent) {
-      return res.status(500).json({ message: err.message });
+    const controller = openSSE(req, res);
+    let full = '';
+    try {
+      full = await generateTextStream(messages, (text) => sendSSE(res, { text }), { signal: controller.signal });
+    } finally {
+      // Persist whatever we got — even a partial answer if the user hit Stop.
+      if (full.trim()) {
+        session.messages.push({ role: 'assistant', content: full });
+        await session.save().catch(e => console.error('Session save failed:', e.message));
+      }
     }
-    res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
-    res.end();
-  }
-});
-
-router.get('/history/:sessionId', protect, async (req, res) => {
-  try {
-    const session = await Session.findOne({
-      sessionId: req.params.sessionId,
-      userId:    req.user.uid,
-    });
-    if (!session) return res.status(404).json({ message: 'Session not found' });
-    return res.status(200).json({ messages: session.messages });
+    recordActivity(req.user.uid);
+    endSSE(res);
   } catch (err) {
-    return res.status(500).json({ message: 'Fetch failed' });
+    if (err.name !== 'AbortError') console.error('Chat error:', err.message);
+    failSSE(res, err);
   }
 });
 
-router.get('/sessions/:noteId', protect, async (req, res) => {
+router.post('/suggest', protect, async (req, res, next) => {
   try {
-    const sessions = await Session.find({
-      noteId: req.params.noteId,
-      userId: req.user.uid,
-    })
-      .select('sessionId createdAt updatedAt')
-      .sort({ updatedAt: -1 });
+    const { noteId } = req.body;
+    assertObjectId(noteId, 'noteId');
+    const note = await Note.findOne({ _id: noteId, userId: req.user.uid }).select('title chunks');
+    if (!note) throw new HttpError(404, 'Note not found');
+
+    const prompt = `Suggest 4 short, interesting questions (max 12 words each) a student might ask about these notes.
+Return JSON: {"questions": [string, string, string, string]}
+
+Notes:
+${retrieveRelevantChunks(note.chunks, '', 6)}`;
+    const questions = (await generateJSONArray(prompt, { maxTokens: 400 }))
+      .filter(q => typeof q === 'string' && q.trim())
+      .slice(0, 4);
+    return res.status(200).json({ questions });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/history/:sessionId', protect, async (req, res, next) => {
+  try {
+    const session = await Session.findOne({ sessionId: req.params.sessionId, userId: req.user.uid });
+    if (!session) throw new HttpError(404, 'Session not found');
+    return res.status(200).json({ messages: session.messages, title: session.title });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/sessions/:noteId', protect, async (req, res, next) => {
+  try {
+    assertObjectId(req.params.noteId, 'noteId');
+    const sessions = await Session.aggregate([
+      { $match: { noteId: new mongoose.Types.ObjectId(req.params.noteId), userId: req.user.uid } },
+      { $sort: { updatedAt: -1 } },
+      { $limit: 50 },
+      { $project: { _id: 0, sessionId: 1, title: 1, createdAt: 1, updatedAt: 1, messageCount: { $size: '$messages' } } },
+    ]);
     return res.status(200).json({ sessions });
   } catch (err) {
-    return res.status(500).json({ message: 'Fetch failed' });
+    next(err);
   }
 });
 
-router.delete('/session/:sessionId', protect, async (req, res) => {
+router.delete('/session/:sessionId', protect, async (req, res, next) => {
   try {
-    await Session.findOneAndDelete({ sessionId: req.params.sessionId, userId: req.user.uid });
+    const deleted = await Session.findOneAndDelete({ sessionId: req.params.sessionId, userId: req.user.uid });
+    if (!deleted) throw new HttpError(404, 'Session not found');
     return res.status(200).json({ message: 'Session deleted' });
   } catch (err) {
-    return res.status(500).json({ message: 'Delete failed' });
+    next(err);
   }
 });
 

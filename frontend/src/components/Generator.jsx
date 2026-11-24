@@ -1,155 +1,134 @@
-import React, { useState, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import toast from 'react-hot-toast';
-import { streamSSE, generateFlashcards, generateMCQ } from '../utils/api';
+import Icon from './ui/Icon';
+import Markdown from './ui/Markdown';
+import { streamSSE } from '../utils/api';
+import { copyText, downloadFile, slugify, plainText } from '../utils/helpers';
 
-export default function Generator({ note, onFlashcards, onMCQ }) {
-  const [output, setOutput] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [mode, setMode] = useState(null);
+export const MODES = [
+  { id: 'summary',   label: 'Summary',      desc: 'Structured overview with key points',  icon: 'book',      color: 'accent' },
+  { id: 'concepts',  label: 'Key concepts', desc: 'Deep dives with real-world examples',  icon: 'lightbulb', color: 'amber' },
+  { id: 'eli5',      label: 'Explain simply', desc: 'Plain-language explanation with analogies', icon: 'baby', color: 'green' },
+  { id: 'mindmap',   label: 'Mind map',     desc: 'Hierarchical outline of every topic',  icon: 'network',   color: 'accent' },
+  { id: 'studyplan', label: 'Study plan',   desc: '5-day plan with active-recall tasks',  icon: 'calendar',  color: 'red' },
+  { id: 'mnemonics', label: 'Memory hooks', desc: 'Mnemonics for the hard-to-remember',   icon: 'zap',       color: 'amber' },
+];
+
+export default function Generator({ note, outputs, setOutput, onNavigate }) {
+  const [mode, setMode]       = useState(() => MODES.find((m) => outputs[m.id])?.id || null);
+  const [loading, setLoading] = useState(null);
+  const [speaking, setSpeak]  = useState(false);
   const abortRef = useRef(null);
 
-  if (!note) {
-    return <p style={s.muted}>Select a note to get started.</p>;
-  }
+  useEffect(() => () => {
+    abortRef.current?.abort();
+    window.speechSynthesis?.cancel();
+  }, []);
 
-  const stream = async (path, label) => {
-    if (abortRef.current) abortRef.current.abort();
+  const run = async (id) => {
+    abortRef.current?.abort();
+    window.speechSynthesis?.cancel();
+    setSpeak(false);
     const controller = new AbortController();
     abortRef.current = controller;
-    setLoading(true);
-    setMode(label);
-    setOutput('');
+    setMode(id);
+    setLoading(id);
+    let text = '';
+    setOutput(note._id, id, '');
     try {
-      await streamSSE(
-        path,
-        { noteId: note._id },
-        (chunk) => setOutput(prev => prev + chunk),
-        () => setLoading(false),
-        (err) => { toast.error(err); setLoading(false); },
-        controller.signal
-      );
+      await streamSSE(`/generate/stream/${id}`, { noteId: note._id }, {
+        signal: controller.signal,
+        onChunk: (chunk) => { text += chunk; setOutput(note._id, id, text); },
+      });
     } catch (err) {
-      if (err.name !== 'AbortError') { toast.error(err.message); setLoading(false); }
+      if (err.name !== 'AbortError') toast.error(err.message);
+    } finally {
+      if (abortRef.current === controller) setLoading(null);
     }
   };
 
-  const flashcards = async () => {
-    setLoading(true);
-    setMode('flashcards');
-    try {
-      const { data } = await generateFlashcards(note._id);
-      onFlashcards(data.flashcards, note._id);
-    } catch (err) {
-      toast.error(err.response?.data?.message || 'Failed');
-    } finally {
-      setLoading(false);
-    }
-  };
+  const stop = () => { abortRef.current?.abort(); setLoading(null); };
 
-  const mcq = async () => {
-    setLoading(true);
-    setMode('mcq');
-    try {
-      const { data } = await generateMCQ(note._id);
-      onMCQ(data.questions);
-    } catch (err) {
-      toast.error(err.response?.data?.message || 'Failed');
-    } finally {
-      setLoading(false);
-    }
+  const output = mode ? outputs[mode] : '';
+  const current = MODES.find((m) => m.id === mode);
+
+  const speak = () => {
+    const synth = window.speechSynthesis;
+    if (!synth) return toast.error('Text-to-speech is not supported in this browser');
+    if (speaking) { synth.cancel(); setSpeak(false); return; }
+    const u = new SpeechSynthesisUtterance(plainText(output));
+    u.rate = 1.02;
+    u.onend = () => setSpeak(false);
+    u.onerror = () => setSpeak(false);
+    synth.speak(u);
+    setSpeak(true);
   };
 
   return (
     <div>
-      <div style={s.context}>
-        <span style={s.contextLabel}>Source</span>
-        <span style={s.contextTitle}>{note.title}</span>
+      <div className="section-head">
+        <div>
+          <h2>Study tools</h2>
+          <p>Generate AI study material from <b style={{ color: 'var(--text)' }}>{note.title}</b>.</p>
+        </div>
+        <div className="row">
+          <button className="btn btn-secondary btn-sm" onClick={() => onNavigate('flashcards')}><Icon name="cards" size={14} /> Flashcards</button>
+          <button className="btn btn-secondary btn-sm" onClick={() => onNavigate('quiz')}><Icon name="quiz" size={14} /> Quiz</button>
+        </div>
       </div>
-      <div style={s.actions}>
-        <button style={s.btn} disabled={loading} onClick={() => stream('/generate/summary', 'summary')}>Summary</button>
-        <button style={s.btn} disabled={loading} onClick={() => stream('/generate/concepts', 'concepts')}>Key Concepts</button>
-        <button style={s.btn} disabled={loading} onClick={flashcards}>Flashcards</button>
-        <button style={s.btn} disabled={loading} onClick={mcq}>Quiz</button>
+
+      <div className="modes">
+        {MODES.map((m) => (
+          <button key={m.id} className={`mode${mode === m.id ? ' on' : ''}`} onClick={() => (outputs[m.id] && !loading ? setMode(m.id) : run(m.id))} disabled={Boolean(loading) && loading !== m.id}>
+            <span className="mode-icon" style={{ background: `var(--${m.color}-soft)`, color: `var(--${m.color})` }}>
+              {loading === m.id ? <span className="spinner" /> : <Icon name={m.icon} size={17} />}
+            </span>
+            <div>
+              <b>{m.label}</b>
+              <span>{m.desc}</span>
+            </div>
+            {outputs[m.id] && loading !== m.id && <i className="cached" title="Generated" />}
+          </button>
+        ))}
       </div>
-      {loading && mode && mode !== 'flashcards' && mode !== 'mcq' && (
-        <div style={s.streaming}>
-          <span style={s.dot} />
-          Generating {mode}...
+
+      {mode && (
+        <div className="card output fade-in">
+          <div className="output-head">
+            <Icon name={current?.icon} size={15} style={{ color: 'var(--accent)' }} />
+            <b style={{ fontSize: 13 }}>{current?.label}</b>
+            {loading === mode && <span className="row muted" style={{ fontSize: 12, gap: 6 }}><i className="dot-pulse" /> Generating…</span>}
+            <div className="spacer" />
+            {loading === mode ? (
+              <button className="btn btn-secondary btn-sm" onClick={stop}><Icon name="stop" size={12} /> Stop</button>
+            ) : output ? (
+              <>
+                <button className={`icon-btn${speaking ? ' active' : ''}`} onClick={speak} title={speaking ? 'Stop reading' : 'Read aloud'} aria-label="Read aloud"><Icon name="volume" /></button>
+                <button className="icon-btn" title="Copy" aria-label="Copy" onClick={async () => ((await copyText(output)) ? toast.success('Copied to clipboard') : toast.error('Copy failed'))}><Icon name="copy" /></button>
+                <button className="icon-btn" title="Download as Markdown" aria-label="Download" onClick={() => downloadFile(`${slugify(note.title)}-${mode}.md`, `# ${note.title} — ${current?.label}\n\n${output}`)}><Icon name="download" /></button>
+                <button className="icon-btn" title="Regenerate" aria-label="Regenerate" onClick={() => run(mode)}><Icon name="refresh" /></button>
+              </>
+            ) : null}
+          </div>
+          <div className="output-body">
+            {output ? <Markdown streaming={loading === mode}>{output}</Markdown> : (
+              loading === mode ? (
+                <div style={{ display: 'grid', gap: 10 }}>
+                  {[90, 75, 82, 60].map((w, i) => <div key={i} className="skeleton" style={{ height: 12, width: `${w}%` }} />)}
+                </div>
+              ) : <p className="muted">Nothing generated yet. <button className="btn btn-ghost btn-sm" onClick={() => run(mode)}>Generate</button></p>
+            )}
+          </div>
         </div>
       )}
-      {output && (
-        <div style={s.output}>{output}</div>
+
+      {!mode && (
+        <div className="empty">
+          <div className="empty-icon"><Icon name="sparkles" size={24} /></div>
+          <h3>Choose a study tool</h3>
+          <p>Pick any card above — results stream in live and are kept while you switch tabs.</p>
+        </div>
       )}
     </div>
   );
 }
-
-const s = {
-  muted: {
-    color: 'var(--text-2)',
-    fontSize: 13,
-  },
-  context: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 8,
-    marginBottom: 16,
-    padding: '8px 12px',
-    background: 'var(--bg-2)',
-    borderRadius: 'var(--radius)',
-  },
-  contextLabel: {
-    fontSize: 11,
-    color: 'var(--text-2)',
-    textTransform: 'uppercase',
-    letterSpacing: '0.04em',
-  },
-  contextTitle: {
-    fontSize: 13,
-    color: 'var(--text-0)',
-    fontWeight: 500,
-  },
-  actions: {
-    display: 'flex',
-    flexWrap: 'wrap',
-    gap: 6,
-    marginBottom: 20,
-  },
-  btn: {
-    padding: '7px 14px',
-    background: 'var(--bg-2)',
-    border: '1px solid var(--border)',
-    borderRadius: 'var(--radius)',
-    color: 'var(--text-1)',
-    fontWeight: 500,
-    fontSize: 13,
-    transition: 'border-color 0.15s, color 0.15s',
-  },
-  streaming: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 8,
-    fontSize: 13,
-    color: 'var(--text-2)',
-    marginBottom: 16,
-  },
-  dot: {
-    width: 6,
-    height: 6,
-    borderRadius: '50%',
-    background: 'var(--accent)',
-    animation: 'pulse 1.5s ease-in-out infinite',
-  },
-  output: {
-    padding: 16,
-    background: 'var(--bg-2)',
-    border: '1px solid var(--border-subtle)',
-    borderRadius: 'var(--radius)',
-    whiteSpace: 'pre-wrap',
-    fontSize: 13,
-    lineHeight: 1.7,
-    color: 'var(--text-1)',
-    maxHeight: 400,
-    overflow: 'auto',
-  },
-};

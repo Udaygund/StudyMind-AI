@@ -1,213 +1,283 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import toast from 'react-hot-toast';
-import { createChatSession, getChatHistory, streamChatMessage } from '../utils/api';
+import Icon from './ui/Icon';
+import Markdown from './ui/Markdown';
+import {
+  createChatSession, listChatSessions, getChatHistory, deleteChatSession,
+  suggestQuestions, streamChatMessage, errMsg,
+} from '../utils/api';
+import { copyText, timeAgo } from '../utils/helpers';
 
-export default function ChatPanel({ note }) {
+// Suggestions cost an AI call — cache them per note for the page lifetime.
+const suggestionCache = new Map();
+const FALLBACK = ['Summarize the main idea in 3 bullets', 'What are the key terms I should know?', 'Give me a tricky exam question', 'What is most likely to be tested?'];
+
+export default function ChatPanel({ note, active }) {
+  const [sessions, setSessions]   = useState([]);
   const [sessionId, setSessionId] = useState(null);
-  const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState('');
-  const [loading, setLoading] = useState(false);
-  const bottomRef = useRef(null);
-  const abortRef = useRef(null);
+  const [messages, setMessages]   = useState([]);
+  const [input, setInput]         = useState('');
+  const [streaming, setStreaming] = useState(false);
+  const [loadingHist, setLH]      = useState(true);
+  const [suggestions, setSugg]    = useState(() => suggestionCache.get(note._id) || null);
+  const abortRef    = useRef(null);
+  const scrollRef   = useRef(null);
+  const inputRef    = useRef(null);
+  const stickBottom = useRef(true);
+  const loadToken   = useRef(0);
+  const openSid     = useRef(null);
 
+  const openSession = useCallback(async (sid) => {
+    abortRef.current?.abort();
+    const token = ++loadToken.current;
+    openSid.current = sid;
+    setSessionId(sid);
+    setLH(true);
+    try {
+      const { data } = sid ? await getChatHistory(sid) : { data: { messages: [] } };
+      if (token === loadToken.current) setMessages(data.messages || []);
+    } catch (err) {
+      if (token === loadToken.current) { setMessages([]); toast.error(errMsg(err, 'Could not load chat')); }
+    } finally {
+      if (token === loadToken.current) setLH(false);
+    }
+  }, []);
+
+  // Load sessions for this note and resume the most recent one.
   useEffect(() => {
-    if (abortRef.current) abortRef.current.abort();
-    if (!note?._id) return;
-    setSessionId(null);
-    setMessages([]);
-    createChatSession(note._id)
+    let alive = true;
+    listChatSessions(note._id)
       .then(({ data }) => {
-        setSessionId(data.sessionId);
-        return getChatHistory(data.sessionId);
+        if (!alive) return;
+        const list = (data.sessions || []).filter((s) => s.messageCount > 0);
+        setSessions(list);
+        openSession(list[0]?.sessionId || null);
       })
-      .then(({ data }) => setMessages(data.messages || []))
-      .catch(() => toast.error('Could not start chat session'));
-  }, [note?._id]);
+      .catch((err) => { if (alive) { setLH(false); toast.error(errMsg(err, 'Could not load chats')); } });
+    return () => { alive = false; abortRef.current?.abort(); };
+  }, [note._id, openSession]);
 
+  // Fetch starter suggestions once per note, only when the chat is visible and empty.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (!active || suggestions || loadingHist || messages.length) return;
+    let alive = true;
+    suggestQuestions(note._id)
+      .then(({ data }) => {
+        const q = data.questions?.length ? data.questions : FALLBACK;
+        suggestionCache.set(note._id, q);
+        if (alive) setSugg(q);
+      })
+      .catch(() => alive && setSugg(FALLBACK));
+    return () => { alive = false; };
+  }, [active, suggestions, loadingHist, messages.length, note._id]);
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el && stickBottom.current) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
-  const send = async () => {
-    if (!input.trim() || !sessionId || loading) return;
-    const userMsg = input.trim();
-    setInput('');
-    setMessages(prev => [...prev, { role: 'user', content: userMsg }]);
-    setLoading(true);
-    let assistant = '';
-    setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
+  useEffect(() => { if (active) inputRef.current?.focus(); }, [active, sessionId]);
 
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (el) stickBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
+
+  const autoGrow = (el) => {
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  };
+
+  const send = async (text) => {
+    const msg = (text ?? input).trim();
+    if (!msg || streaming) return;
+    setInput('');
+    requestAnimationFrame(() => autoGrow(inputRef.current));
+    stickBottom.current = true;
+
+    let sid = sessionId;
+    if (!sid) {
+      try {
+        const { data } = await createChatSession(note._id);
+        sid = data.sessionId;
+        openSid.current = sid;
+        setSessionId(sid);
+      } catch (err) {
+        setInput(msg);
+        return toast.error(errMsg(err, 'Could not start chat'));
+      }
+    }
+
+    setMessages((prev) => [...prev, { role: 'user', content: msg }, { role: 'assistant', content: '' }]);
+    setStreaming(true);
     const controller = new AbortController();
     abortRef.current = controller;
+    let answer = '';
+    const update = (content, extra = {}) => setMessages((prev) => {
+      // Guard: the user may have switched conversations mid-stream.
+      if (openSid.current !== sid || prev[prev.length - 1]?.role !== 'assistant') return prev;
+      const next = [...prev];
+      next[next.length - 1] = { role: 'assistant', content, ...extra };
+      return next;
+    });
 
     try {
-      await streamChatMessage(
-        sessionId,
-        userMsg,
-        (chunk) => {
-          assistant += chunk;
-          setMessages(prev => {
-            const next = [...prev];
-            next[next.length - 1] = { role: 'assistant', content: assistant };
-            return next;
-          });
-        },
-        () => setLoading(false),
-        (err) => { toast.error(err); setLoading(false); },
-        controller.signal
-      );
+      await streamChatMessage(sid, msg, {
+        signal: controller.signal,
+        onChunk: (chunk) => { answer += chunk; update(answer); },
+      });
+      if (!answer) update('_No response — please try again._', { error: true });
     } catch (err) {
-      if (err.name !== 'AbortError') { toast.error(err.message); setLoading(false); }
+      if (err.name === 'AbortError') {
+        update(answer ? `${answer}\n\n_— stopped_` : '_Stopped._');
+      } else {
+        update(answer || `⚠️ ${err.message}`, { error: !answer });
+        toast.error(err.message);
+      }
+    } finally {
+      if (abortRef.current === controller) {
+        setStreaming(false);
+        abortRef.current = null;
+      }
+      setSessions((prev) => {
+        const title = prev.find((s) => s.sessionId === sid)?.title || (msg.length > 60 ? `${msg.slice(0, 57)}…` : msg);
+        return [{ sessionId: sid, title, updatedAt: new Date().toISOString(), messageCount: 1 }, ...prev.filter((s) => s.sessionId !== sid)];
+      });
     }
   };
 
-  if (!note) return <p style={s.muted}>Select a note to chat.</p>;
+  const newChat = () => {
+    if (streaming) abortRef.current?.abort();
+    openSession(null);
+  };
+
+  const removeSession = async (sid) => {
+    try {
+      await deleteChatSession(sid);
+      setSessions((prev) => prev.filter((s) => s.sessionId !== sid));
+      if (sid === sessionId) openSession(null);
+    } catch (err) {
+      toast.error(errMsg(err, 'Delete failed'));
+    }
+  };
+
+  const onKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+      e.preventDefault();
+      send();
+    }
+  };
 
   return (
-    <div style={s.wrap}>
-      <div style={s.messages}>
-        {messages.length === 0 && (
-          <div style={s.empty}>Ask anything about "{note.title}"</div>
-        )}
-        {messages.map((m, i) => (
-          <div key={i} style={m.role === 'user' ? s.userRow : s.botRow}>
-            {m.role === 'assistant' && (
-              <div style={s.avatar}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M12 8V4H8" /><rect width="16" height="12" x="4" y="8" rx="2" /><path d="M2 14h2" /><path d="M20 14h2" /><path d="M15 13v2" /><path d="M9 13v2" />
-                </svg>
-              </div>
-            )}
-            <div style={m.role === 'user' ? s.userBubble : s.botBubble}>
-              {m.content || (loading && i === messages.length - 1 ? <span style={s.typing}>...</span> : '')}
+    <div className="chat">
+      <div className="chat-sessions">
+        <button className="btn btn-secondary btn-block" onClick={newChat} style={{ marginBottom: 8 }}>
+          <Icon name="plus" size={14} /> New chat
+        </button>
+        <span className="label" style={{ padding: '6px 10px' }}>History</span>
+        {sessions.length === 0 && <p className="muted" style={{ fontSize: 12, padding: '4px 10px' }}>No conversations yet.</p>}
+        {sessions.map((s) => (
+          <div key={s.sessionId} className={`session${s.sessionId === sessionId ? ' on' : ''}`}
+            role="button" tabIndex={0}
+            onClick={() => s.sessionId !== sessionId && openSession(s.sessionId)}
+            onKeyDown={(e) => e.key === 'Enter' && openSession(s.sessionId)}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="truncate">{s.title || 'Chat'}</div>
+              <div className="muted" style={{ fontSize: 11 }}>{timeAgo(s.updatedAt)}</div>
             </div>
+            <button className="icon-btn danger" aria-label="Delete chat"
+              onClick={(e) => { e.stopPropagation(); removeSession(s.sessionId); }}>
+              <Icon name="trash" size={12} />
+            </button>
           </div>
         ))}
-        <div ref={bottomRef} />
       </div>
-      <div style={s.inputRow}>
-        <input
-          style={s.input}
-          value={input}
-          onChange={e => setInput(e.target.value)}
-          onKeyDown={e => e.key === 'Enter' && send()}
-          placeholder="Ask about your notes..."
-          disabled={loading || !sessionId}
-        />
-        <button
-          style={{ ...s.send, ...((loading || !sessionId || !input.trim()) ? s.sendDisabled : {}) }}
-          onClick={send}
-          disabled={loading || !sessionId}
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" />
-          </svg>
-        </button>
+
+      <div className="card chat-main">
+        <div className="messages" ref={scrollRef} onScroll={onScroll} aria-live="polite">
+          {loadingHist ? (
+            <div style={{ display: 'grid', gap: 14 }}>
+              <div className="skeleton" style={{ height: 40, width: '45%', justifySelf: 'end' }} />
+              <div className="skeleton" style={{ height: 80, width: '70%' }} />
+            </div>
+          ) : messages.length === 0 ? (
+            <div className="chat-welcome fade-in">
+              <div className="empty-icon" style={{ margin: '0 auto' }}><Icon name="bot" size={24} /></div>
+              <h3>Ask your notes anything</h3>
+              <p className="muted" style={{ fontSize: 13 }}>Answers come from “{note.title}”, so they stay accurate to what you're studying.</p>
+              <div className="chips">
+                {(suggestions || [0, 1, 2, 3]).map((q, i) => (
+                  typeof q === 'string'
+                    ? <button key={i} className="chip" onClick={() => send(q)}>{q}</button>
+                    : <div key={i} className="skeleton" style={{ height: 40 }} />
+                ))}
+              </div>
+            </div>
+          ) : (
+            messages.map((m, i) => {
+              const isLast = i === messages.length - 1;
+              if (m.role === 'user') {
+                return <div key={i} className="msg user"><div className="bubble">{m.content}</div></div>;
+              }
+              return (
+                <div key={i} className="msg bot">
+                  <div className="msg-avatar"><Icon name="logo" size={15} /></div>
+                  <div style={{ minWidth: 0, maxWidth: '100%' }}>
+                    <div className="bubble" style={m.error ? { borderColor: 'var(--red)' } : undefined}>
+                      {m.content
+                        ? <Markdown streaming={streaming && isLast}>{m.content}</Markdown>
+                        : <span className="typing"><i /><i /><i /></span>}
+                    </div>
+                    {m.content && !(streaming && isLast) && (
+                      <div className="msg-tools">
+                        <button className="icon-btn" title="Copy" aria-label="Copy answer"
+                          onClick={async () => ((await copyText(m.content)) ? toast.success('Copied') : toast.error('Copy failed'))}>
+                          <Icon name="copy" size={13} />
+                        </button>
+                        {isLast && i > 0 && (
+                          <button className="icon-btn" title="Ask again" aria-label="Ask again"
+                            onClick={() => { const q = messages[i - 1]?.content; setMessages((p) => p.slice(0, -2)); send(q); }}>
+                            <Icon name="refresh" size={13} />
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        <div className="composer">
+          <div className="composer-box">
+            <textarea
+              ref={inputRef}
+              rows={1}
+              value={input}
+              placeholder={`Ask about “${note.title}”…`}
+              onChange={(e) => { setInput(e.target.value); autoGrow(e.target); }}
+              onKeyDown={onKeyDown}
+              maxLength={4000}
+              aria-label="Message"
+            />
+            {streaming ? (
+              <button className="btn btn-secondary" style={{ height: 36, width: 36, padding: 0 }} onClick={() => abortRef.current?.abort()} aria-label="Stop generating">
+                <Icon name="stop" size={13} />
+              </button>
+            ) : (
+              <button className="btn btn-primary" style={{ height: 36, width: 36, padding: 0 }} onClick={() => send()} disabled={!input.trim() || loadingHist} aria-label="Send">
+                <Icon name="send" size={15} />
+              </button>
+            )}
+          </div>
+          <div className="composer-hint">
+            <span><span className="kbd">↵</span> send · <span className="kbd">⇧</span>+<span className="kbd">↵</span> new line</span>
+            <span>Grounded in your notes</span>
+          </div>
+        </div>
       </div>
     </div>
   );
 }
-
-const s = {
-  muted: {
-    color: 'var(--text-2)',
-    fontSize: 13,
-  },
-  wrap: {
-    display: 'flex',
-    flexDirection: 'column',
-    height: 420,
-  },
-  messages: {
-    flex: 1,
-    overflowY: 'auto',
-    marginBottom: 12,
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 12,
-    padding: '4px 0',
-  },
-  empty: {
-    flex: 1,
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    color: 'var(--text-2)',
-    fontSize: 13,
-    fontStyle: 'italic',
-  },
-  userRow: {
-    display: 'flex',
-    justifyContent: 'flex-end',
-  },
-  botRow: {
-    display: 'flex',
-    gap: 8,
-    alignItems: 'flex-start',
-  },
-  avatar: {
-    width: 24,
-    height: 24,
-    borderRadius: 6,
-    background: 'var(--bg-3)',
-    border: '1px solid var(--border)',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    flexShrink: 0,
-    color: 'var(--text-2)',
-    marginTop: 2,
-  },
-  userBubble: {
-    maxWidth: '70%',
-    padding: '8px 12px',
-    borderRadius: '12px 12px 2px 12px',
-    fontSize: 13,
-    lineHeight: 1.5,
-    background: 'var(--text-0)',
-    color: 'var(--bg-0)',
-  },
-  botBubble: {
-    maxWidth: '75%',
-    padding: '8px 12px',
-    borderRadius: '12px 12px 12px 2px',
-    fontSize: 13,
-    lineHeight: 1.5,
-    background: 'var(--bg-2)',
-    border: '1px solid var(--border-subtle)',
-    color: 'var(--text-1)',
-  },
-  typing: {
-    opacity: 0.5,
-  },
-  inputRow: {
-    display: 'flex',
-    gap: 6,
-  },
-  input: {
-    flex: 1,
-    padding: '9px 12px',
-    background: 'var(--bg-2)',
-    border: '1px solid var(--border)',
-    borderRadius: 'var(--radius)',
-    color: 'var(--text-0)',
-    fontSize: 13,
-    transition: 'border-color 0.15s',
-  },
-  send: {
-    width: 36,
-    height: 36,
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    background: 'var(--text-0)',
-    color: 'var(--bg-0)',
-    borderRadius: 'var(--radius)',
-    transition: 'opacity 0.15s',
-    flexShrink: 0,
-  },
-  sendDisabled: {
-    opacity: 0.3,
-    cursor: 'not-allowed',
-  },
-};

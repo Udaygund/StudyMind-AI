@@ -1,190 +1,247 @@
-const express  = require('express');
-const router   = express.Router();
+const express   = require('express');
 const { protect } = require('../middleware/auth');
-const Note     = require('../models/Note');
-const Flashcard = require('../models/Flashcard');
-const { retrieveRelevantChunks } = require('../utils/chunker');
-const { generateTextStream, generateJSON } = require('../utils/gemini');
+const Note        = require('../models/Note');
+const Flashcard   = require('../models/Flashcard');
+const QuizAttempt = require('../models/QuizAttempt');
+const { sampleChunks } = require('../utils/chunker');
+const { generateTextStream, generateJSONArray } = require('../utils/llm');
+const { openSSE, sendSSE, endSSE, failSSE } = require('../utils/sse');
+const { HttpError, assertObjectId, clampInt } = require('../utils/validate');
+const { recordActivity } = require('../utils/activity');
+
+const router = express.Router();
 
 const getNote = async (noteId, userId) => {
+  assertObjectId(noteId, 'noteId');
   const note = await Note.findOne({ _id: noteId, userId });
-  if (!note) throw new Error('Note not found or access denied');
+  if (!note) throw new HttpError(404, 'Note not found');
+  if (!note.chunks?.length) throw new HttpError(400, 'This note has no indexed text');
   return note;
 };
 
-router.post('/summary', protect, async (req, res) => {
+const DIFFICULTY = {
+  easy:   'Keep questions straightforward — recall of definitions and key facts.',
+  medium: 'Mix recall with understanding — ask why and how, not only what.',
+  hard:   'Make questions demanding — application, comparison, edge cases and multi-step reasoning.',
+};
+const pickDifficulty = (d) => (DIFFICULTY[d] ? d : 'medium');
+
+// ── Streaming text modes ─────────────────────────────────────────────────────
+const MODES = {
+  summary: {
+    chunks: 10,
+    prompt: (ctx) => `You are an expert study assistant. Write a clear, well-structured summary of these notes in Markdown.
+Use these sections with "##" headings:
+## Overview
+## Key Points  (bulleted)
+## Important Definitions  (bold the term, then the definition)
+## Takeaways
+
+Notes:
+${ctx}`,
+  },
+  concepts: {
+    chunks: 10,
+    prompt: (ctx) => `You are a study assistant. Identify the 4-6 most important concepts in these notes and explain each in Markdown.
+For each concept use a "### Concept name" heading, then:
+- **Explanation:** 2-4 sentences
+- **Example:** a simple real-world example
+- **Why it matters:** one sentence
+
+Notes:
+${ctx}`,
+  },
+  eli5: {
+    chunks: 8,
+    prompt: (ctx) => `Explain the main ideas of these notes as if to a curious 10-year-old. Use simple words, short paragraphs,
+friendly analogies and Markdown formatting. End with a "## In one sentence" section.
+
+Notes:
+${ctx}`,
+  },
+  studyplan: {
+    chunks: 10,
+    prompt: (ctx) => `Create a practical 5-day study plan in Markdown for mastering these notes.
+For each day use a "### Day N — <focus>" heading with: goals, what to review, an active-recall exercise,
+and an estimated time. Finish with a "## Exam-day checklist".
+
+Notes:
+${ctx}`,
+  },
+  mindmap: {
+    chunks: 10,
+    prompt: (ctx) => `Build a hierarchical outline (mind map) of these notes in Markdown.
+Use a single "#" root topic, then nested bullet lists (max 4 levels deep). Keep each node under 8 words.
+Output only the outline.
+
+Notes:
+${ctx}`,
+  },
+  mnemonics: {
+    chunks: 8,
+    prompt: (ctx) => `Create memorable mnemonics, acronyms and memory hooks for the hardest-to-remember facts in these notes.
+Use Markdown: a "### <fact>" heading for each, then the mnemonic in bold and a one-line explanation. Give 4-6 items.
+
+Notes:
+${ctx}`,
+  },
+};
+
+const streamMode = (fixedMode) => async (req, res) => {
+  try {
+    const mode = MODES[fixedMode || req.params.mode];
+    if (!mode) throw new HttpError(400, 'Unknown generation mode');
+    const note = await getNote(req.body.noteId, req.user.uid);
+    const prompt = mode.prompt(sampleChunks(note.chunks, mode.chunks));
+
+    const controller = openSSE(req, res);
+    await generateTextStream(prompt, (text) => sendSSE(res, { text }), { signal: controller.signal });
+    recordActivity(req.user.uid);
+    endSSE(res);
+  } catch (err) {
+    if (err.name !== 'AbortError') console.error('Stream generate error:', err.message);
+    failSSE(res, err);
+  }
+};
+
+router.post('/stream/:mode', protect, streamMode());
+// Backwards-compatible aliases for the original endpoints.
+router.post('/summary',  protect, streamMode('summary'));
+router.post('/concepts', protect, streamMode('concepts'));
+
+// ── Flashcards ───────────────────────────────────────────────────────────────
+router.post('/flashcards', protect, async (req, res, next) => {
   try {
     const { noteId } = req.body;
-    const note       = await getNote(noteId, req.user.uid);
-    const context    = retrieveRelevantChunks(note.chunks, '', 6);
+    const count = clampInt(req.body.count, 3, 30, 10);
+    const difficulty = pickDifficulty(req.body.difficulty);
+    const note = await getNote(noteId, req.user.uid);
 
-    const prompt = `You are an expert study assistant. Based on the following lecture notes, write a clear, structured summary.
-Include:
-- Main topic and overview
-- Key concepts (bullet points)
-- Important details and definitions
-- Conclusion / takeaways
-
-Notes:
-${context}
-
-Write the summary now:`;
-
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders();
-
-    await generateTextStream(prompt, (chunk) => {
-      res.write(`data: ${JSON.stringify({ text: chunk })}\n\n`);
-    });
-
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    res.end();
-  } catch (err) {
-    console.error('Summary error:', err);
-    if (!res.headersSent) return res.status(500).json({ message: err.message });
-    res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
-    res.end();
-  }
-});
-
-router.post('/concepts', protect, async (req, res) => {
-  try {
-    const { noteId } = req.body;
-    const note       = await getNote(noteId, req.user.uid);
-    const context    = retrieveRelevantChunks(note.chunks, '', 6);
-
-    const prompt = `You are a study assistant. Identify and deeply explain the 4-6 most important concepts from these notes.
-
-For each concept:
-- Name the concept clearly
-- Give a full explanation (2-4 sentences)
-- Provide a simple real-world example
-- Note why it matters
+    const prompt = `Generate exactly ${count} high-quality study flashcards from these notes.
+${DIFFICULTY[difficulty]}
+Each answer should be concise (1-3 sentences). Avoid duplicate questions.
+Return JSON: {"cards": [{"question": string, "answer": string}, ...]}
 
 Notes:
-${context}
+${sampleChunks(note.chunks, 12)}`;
 
-Explain each concept now:`;
-
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders();
-
-    await generateTextStream(prompt, (chunk) => {
-      res.write(`data: ${JSON.stringify({ text: chunk })}\n\n`);
-    });
-
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    res.end();
-  } catch (err) {
-    if (!res.headersSent) return res.status(500).json({ message: err.message });
-    res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
-    res.end();
-  }
-});
-
-router.post('/flashcards', protect, async (req, res) => {
-  try {
-    const { noteId, count = 8 } = req.body;
-    const note    = await getNote(noteId, req.user.uid);
-    const context = retrieveRelevantChunks(note.chunks, '', 6);
-
-    const prompt = `You are a study assistant. Generate exactly ${count} high-quality flashcards from these notes.
-Return ONLY a valid JSON array. No markdown, no explanation, no extra text.
-Each object must have exactly: "question" (string) and "answer" (string).
-
-Notes:
-${context}
-
-JSON array:`;
-
-    const cards = await generateJSON(prompt);
-
-    if (!Array.isArray(cards)) throw new Error('Gemini did not return an array');
+    const cards = await generateJSONArray(prompt);
     const validated = cards
-      .filter(c => c.question && c.answer)
-      .map(c => ({ question: String(c.question), answer: String(c.answer), learned: false }));
+      .filter(c => c && c.question && c.answer)
+      .slice(0, count)
+      .map(c => ({ question: String(c.question).trim(), answer: String(c.answer).trim(), learned: false }));
+    if (!validated.length) throw new HttpError(502, 'AI returned no usable flashcards — try again');
 
     const saved = await Flashcard.findOneAndUpdate(
       { userId: req.user.uid, noteId },
       { userId: req.user.uid, noteId, cards: validated },
-      { upsert: true, new: true }
+      { upsert: true, new: true, setDefaultsOnInsert: true }
     );
-
-    return res.status(200).json({
-      message:    'Flashcards generated',
-      flashcards: saved.cards,
-      _id:        saved._id,
-    });
+    recordActivity(req.user.uid);
+    return res.status(200).json({ message: 'Flashcards generated', flashcards: saved.cards, _id: saved._id });
   } catch (err) {
-    console.error('Flashcards error:', err);
-    return res.status(500).json({ message: err.message || 'Failed to generate flashcards' });
+    next(err);
   }
 });
 
-router.post('/mcq', protect, async (req, res) => {
+router.get('/flashcards/:noteId', protect, async (req, res, next) => {
   try {
-    const { noteId, count = 5 } = req.body;
-    const note    = await getNote(noteId, req.user.uid);
-    const context = retrieveRelevantChunks(note.chunks, '', 6);
+    assertObjectId(req.params.noteId, 'noteId');
+    const deck = await Flashcard.findOne({ noteId: req.params.noteId, userId: req.user.uid });
+    return res.status(200).json({ flashcards: deck?.cards || [], _id: deck?._id || null });
+  } catch (err) {
+    next(err);
+  }
+});
 
-    const prompt = `You are a study assistant. Generate exactly ${count} multiple-choice questions from these notes.
-Return ONLY a valid JSON array. No markdown, no explanation, no extra text.
-Each object must have:
-- "question": string
-- "options": array of exactly 4 strings
-- "correct": number (0-3, index of correct option)
-- "explanation": string (why the answer is correct)
+router.patch('/flashcards/:noteId/learned', protect, async (req, res, next) => {
+  try {
+    assertObjectId(req.params.noteId, 'noteId');
+    const { cardIndex, learned } = req.body;
+    const deck = await Flashcard.findOne({ noteId: req.params.noteId, userId: req.user.uid });
+    if (!deck) throw new HttpError(404, 'Flashcard deck not found');
+    if (!Number.isInteger(cardIndex) || cardIndex < 0 || cardIndex >= deck.cards.length) {
+      throw new HttpError(400, 'Invalid cardIndex');
+    }
+    deck.cards[cardIndex].learned = Boolean(learned);
+    deck.markModified('cards');
+    await deck.save();
+    recordActivity(req.user.uid);
+    return res.status(200).json({ message: 'Updated', cards: deck.cards });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── Multiple-choice quiz ─────────────────────────────────────────────────────
+router.post('/mcq', protect, async (req, res, next) => {
+  try {
+    const count = clampInt(req.body.count, 3, 20, 5);
+    const difficulty = pickDifficulty(req.body.difficulty);
+    const note = await getNote(req.body.noteId, req.user.uid);
+
+    const prompt = `Generate exactly ${count} multiple-choice questions from these notes.
+${DIFFICULTY[difficulty]}
+Each question has exactly 4 plausible options and exactly one correct answer. Vary the position of the correct answer.
+Return JSON: {"questions": [{"question": string, "options": [4 strings], "correct": 0-3, "explanation": string}, ...]}
 
 Notes:
-${context}
+${sampleChunks(note.chunks, 12)}`;
 
-JSON array:`;
-
-    const questions = await generateJSON(prompt);
-
-    if (!Array.isArray(questions)) throw new Error('Gemini did not return an array');
+    const questions = await generateJSONArray(prompt);
     const validated = questions
-      .filter(q => q.question && Array.isArray(q.options) && q.options.length === 4 && typeof q.correct === 'number')
+      .filter(q => q && q.question && Array.isArray(q.options) && q.options.length === 4)
       .map(q => ({
         question:    String(q.question),
         options:     q.options.map(String),
         correct:     Number(q.correct),
         explanation: String(q.explanation || ''),
-      }));
+      }))
+      .filter(q => Number.isInteger(q.correct) && q.correct >= 0 && q.correct <= 3)
+      .slice(0, count);
+    if (!validated.length) throw new HttpError(502, 'AI returned no usable questions — try again');
 
-    return res.status(200).json({ message: 'MCQs generated', questions: validated });
+    recordActivity(req.user.uid);
+    return res.status(200).json({ message: 'MCQs generated', questions: validated, difficulty });
   } catch (err) {
-    console.error('MCQ error:', err);
-    return res.status(500).json({ message: err.message || 'Failed to generate MCQs' });
+    next(err);
   }
 });
 
-router.patch('/flashcards/:noteId/learned', protect, async (req, res) => {
+router.post('/mcq/attempt', protect, async (req, res, next) => {
   try {
-    const { cardIndex, learned } = req.body;
-    const deck = await Flashcard.findOne({ noteId: req.params.noteId, userId: req.user.uid });
-    if (!deck) return res.status(404).json({ message: 'Flashcard deck not found' });
+    const { noteId } = req.body;
+    assertObjectId(noteId, 'noteId');
+    const total = clampInt(req.body.total, 1, 100, 0);
+    const score = clampInt(req.body.score, 0, total, 0);
+    if (!total) throw new HttpError(400, 'total required');
+    const note = await Note.exists({ _id: noteId, userId: req.user.uid });
+    if (!note) throw new HttpError(404, 'Note not found');
 
-    deck.cards[cardIndex].learned = learned;
-    await deck.save();
-
-    return res.status(200).json({ message: 'Updated', cards: deck.cards });
+    const attempt = await QuizAttempt.create({
+      userId: req.user.uid,
+      noteId,
+      score,
+      total,
+      difficulty:  pickDifficulty(req.body.difficulty),
+      durationSec: clampInt(req.body.durationSec, 0, 86400, 0),
+    });
+    recordActivity(req.user.uid);
+    return res.status(201).json({ attempt });
   } catch (err) {
-    return res.status(500).json({ message: 'Update failed' });
+    next(err);
   }
 });
 
-router.get('/flashcards/:noteId', protect, async (req, res) => {
+router.get('/mcq/attempts/:noteId', protect, async (req, res, next) => {
   try {
-    const deck = await Flashcard.findOne({ noteId: req.params.noteId, userId: req.user.uid });
-    if (!deck) return res.status(404).json({ message: 'No flashcards for this note' });
-    return res.status(200).json({ flashcards: deck.cards, _id: deck._id });
+    assertObjectId(req.params.noteId, 'noteId');
+    const attempts = await QuizAttempt.find({ noteId: req.params.noteId, userId: req.user.uid })
+      .sort({ createdAt: -1 })
+      .limit(20);
+    return res.status(200).json({ attempts });
   } catch (err) {
-    return res.status(500).json({ message: 'Fetch failed' });
+    next(err);
   }
 });
 

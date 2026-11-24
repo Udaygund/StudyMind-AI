@@ -1,157 +1,110 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import toast from 'react-hot-toast';
-import { uploadNote, indexText } from '../utils/api';
+import Icon from './ui/Icon';
+import { uploadNote, indexText, errMsg } from '../utils/api';
+
+const MAX_MB = 15;
+const ACCEPT = /\.(pdf|txt|md|markdown)$/i;
 
 export default function UploadZone({ onNoteCreated }) {
-  const [title, setTitle] = useState('');
-  const [text, setText]   = useState('');
-  const [loading, setLoading] = useState(false);
+  const [title, setTitle]     = useState('');
+  const [text, setText]       = useState('');
+  const [busy, setBusy]       = useState(false);
+  const [drag, setDrag]       = useState(false);
+  const [progress, setProg]   = useState(0);
+  const inputRef = useRef(null);
+  const dragDepth = useRef(0);
 
-  const onFile = async (e) => {
-    const file = e.target.files?.[0];
+  const uploadFile = async (file) => {
     if (!file) return;
-    setLoading(true);
+    if (!ACCEPT.test(file.name)) return toast.error('Only PDF, TXT or Markdown files are supported');
+    if (file.size > MAX_MB * 1024 * 1024) return toast.error(`File too large (max ${MAX_MB} MB)`);
+    setBusy(true);
+    setProg(0);
     try {
       const fd = new FormData();
       fd.append('file', file);
-      if (title) fd.append('title', title);
-      const { data } = await uploadNote(fd);
+      if (title.trim()) fd.append('title', title.trim());
+      const { data } = await uploadNote(fd, (e) => e.total && setProg(Math.round((e.loaded / e.total) * 100)));
+      setTitle('');
       onNoteCreated(data);
     } catch (err) {
-      toast.error(err.response?.data?.message || 'Upload failed');
+      toast.error(errMsg(err, 'Upload failed'));
     } finally {
-      setLoading(false);
-      e.target.value = '';
+      setBusy(false);
+      if (inputRef.current) inputRef.current.value = '';
     }
+  };
+
+  const onDrop = (e) => {
+    e.preventDefault();
+    dragDepth.current = 0;
+    setDrag(false);
+    if (busy) return;
+    uploadFile(e.dataTransfer.files?.[0]);
   };
 
   const onPaste = async () => {
     if (!text.trim()) return toast.error('Paste some text first');
-    setLoading(true);
+    if (text.trim().length < 50) return toast.error('Add a bit more text (at least 50 characters)');
+    setBusy(true);
     try {
-      const { data } = await indexText({ title: title || 'Pasted notes', text });
-      onNoteCreated(data);
+      const { data } = await indexText({ title: title.trim() || 'Pasted notes', text });
       setText('');
+      setTitle('');
+      onNoteCreated(data);
     } catch (err) {
-      toast.error(err.response?.data?.message || 'Failed to index');
+      toast.error(errMsg(err, 'Failed to save notes'));
     } finally {
-      setLoading(false);
+      setBusy(false);
     }
   };
 
+  const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+
   return (
-    <div>
-      <input
-        style={s.input}
-        placeholder="Note title (optional)"
-        value={title}
-        onChange={e => setTitle(e.target.value)}
-      />
-      <label style={s.drop}>
-        <input type="file" accept=".pdf,.txt,.md" onChange={onFile} disabled={loading} hidden />
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--text-2)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginBottom: 8 }}>
-          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-          <polyline points="17 8 12 3 7 8" />
-          <line x1="12" y1="3" x2="12" y2="15" />
-        </svg>
-        <div style={s.dropTitle}>{loading ? 'Uploading...' : 'Drop a file or click to browse'}</div>
-        <div style={s.dropSub}>PDF, TXT, or Markdown</div>
-      </label>
-      <div style={s.divider}>
-        <span style={s.dividerLine} />
-        <span style={s.dividerText}>or paste text</span>
-        <span style={s.dividerLine} />
+    <div style={{ maxWidth: 720, margin: '0 auto' }}>
+      <div className="section-head">
+        <div>
+          <h2>Add study material</h2>
+          <p>Upload lecture slides, a textbook chapter or paste your notes — we'll index them for AI study tools.</p>
+        </div>
       </div>
-      <textarea
-        style={s.textarea}
-        placeholder="Paste lecture notes here..."
-        value={text}
-        onChange={e => setText(e.target.value)}
-        rows={8}
-      />
-      <button style={{ ...s.btn, ...(loading ? s.btnDisabled : {}) }} onClick={onPaste} disabled={loading}>
-        Index text
-      </button>
+
+      <div className="field">
+        <label className="label" htmlFor="note-title">Title <span style={{ textTransform: 'none', letterSpacing: 0, fontWeight: 400 }}>(optional)</span></label>
+        <input id="note-title" className="input" placeholder="e.g. Biology — Chapter 4: Cell respiration"
+          value={title} onChange={(e) => setTitle(e.target.value)} maxLength={120} />
+      </div>
+
+      <div
+        className={`dropzone${drag ? ' drag' : ''}${busy ? ' busy' : ''}`}
+        role="button"
+        tabIndex={0}
+        onClick={() => !busy && inputRef.current?.click()}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); inputRef.current?.click(); } }}
+        onDragEnter={(e) => { e.preventDefault(); dragDepth.current++; setDrag(true); }}
+        onDragOver={(e) => e.preventDefault()}
+        onDragLeave={() => { dragDepth.current = Math.max(0, dragDepth.current - 1); if (!dragDepth.current) setDrag(false); }}
+        onDrop={onDrop}
+      >
+        <input ref={inputRef} type="file" accept=".pdf,.txt,.md,.markdown" hidden
+          onChange={(e) => uploadFile(e.target.files?.[0])} />
+        <div className="dropzone-icon">{busy ? <span className="spinner" /> : <Icon name="upload" size={24} />}</div>
+        <h3>{busy ? (progress < 100 ? `Uploading… ${progress}%` : 'Extracting & indexing…') : drag ? 'Drop to upload' : 'Drag & drop a file, or click to browse'}</h3>
+        <p>PDF, TXT or Markdown · up to {MAX_MB} MB</p>
+      </div>
+
+      <div className="divider">or paste text</div>
+
+      <textarea className="textarea" rows={10} placeholder="Paste lecture notes, an article, or anything you want to learn…"
+        value={text} onChange={(e) => setText(e.target.value)} disabled={busy} />
+      <div className="field-foot">
+        <span className="muted" style={{ fontSize: 12 }}>{words.toLocaleString()} words</span>
+        <button className="btn btn-primary" onClick={onPaste} disabled={busy || !text.trim()}>
+          {busy ? <span className="spinner" /> : <Icon name="sparkles" />} Save & index
+        </button>
+      </div>
     </div>
   );
 }
-
-const s = {
-  input: {
-    width: '100%',
-    padding: '9px 12px',
-    background: 'var(--bg-2)',
-    border: '1px solid var(--border)',
-    borderRadius: 'var(--radius)',
-    color: 'var(--text-0)',
-    marginBottom: 12,
-    boxSizing: 'border-box',
-    fontSize: 13,
-    transition: 'border-color 0.15s',
-  },
-  drop: {
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'center',
-    justifyContent: 'center',
-    border: '1px dashed var(--border)',
-    borderRadius: 'var(--radius-lg)',
-    padding: '32px 24px',
-    cursor: 'pointer',
-    marginBottom: 16,
-    transition: 'border-color 0.15s, background 0.15s',
-  },
-  dropTitle: {
-    color: 'var(--text-1)',
-    fontSize: 13,
-    fontWeight: 500,
-    marginBottom: 2,
-  },
-  dropSub: {
-    color: 'var(--text-2)',
-    fontSize: 12,
-  },
-  divider: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 12,
-    margin: '16px 0',
-  },
-  dividerLine: {
-    flex: 1,
-    height: 1,
-    background: 'var(--border-subtle)',
-  },
-  dividerText: {
-    color: 'var(--text-2)',
-    fontSize: 12,
-    whiteSpace: 'nowrap',
-  },
-  textarea: {
-    width: '100%',
-    padding: '10px 12px',
-    background: 'var(--bg-2)',
-    border: '1px solid var(--border)',
-    borderRadius: 'var(--radius)',
-    color: 'var(--text-0)',
-    resize: 'vertical',
-    fontSize: 13,
-    lineHeight: 1.6,
-    boxSizing: 'border-box',
-    transition: 'border-color 0.15s',
-  },
-  btn: {
-    marginTop: 12,
-    padding: '9px 20px',
-    background: 'var(--text-0)',
-    color: 'var(--bg-0)',
-    borderRadius: 'var(--radius)',
-    fontWeight: 500,
-    fontSize: 13,
-    transition: 'opacity 0.15s',
-  },
-  btnDisabled: {
-    opacity: 0.5,
-    cursor: 'not-allowed',
-  },
-};
